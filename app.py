@@ -1,23 +1,27 @@
 # app.py
-import sqlite3
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+import sqlite3
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.decomposition import PCA
 import pickle
 import os
-from datetime import date
+from datetime import date  # Импортируем date для форматирования
 
 app = Flask(__name__)
 
 # --- Импортируем функции работы с базой данных ---
 from database import init_db, load_data_from_csv_to_db, get_all_students, add_student, get_student, get_student_games, \
-    add_game, get_all_games, add_assignment, get_student_data_for_model, update_student, delete_student
+    add_game, get_all_games, add_assignment, get_student_data_for_model, update_student, \
+    delete_student  # Импортируем новую функцию
 
 # Путь к модели и скалеру
 MODEL_PATH = 'model.pkl'
 SCALER_PATH = 'scaler.pkl'
+DB_PATH = 'students.db'
 
 # Глобальные переменные для модели
 kmeans_model = None
@@ -37,42 +41,19 @@ def load_model_and_data():
 
     # Загружаем все игры и диагнозы из базы данных
     all_games_from_db = get_all_games()
-
-    # Получаем диагнозы через функцию базы данных
-    from database import get_connection
-    conn = get_connection()
-
-    try:
-        if hasattr(conn, 'cursor'):
-            # PostgreSQL через psycopg
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
-            diagnoses = cursor.fetchall()
-            cursor.close()
-        else:
-            # SQLite
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
-            diagnoses = cursor.fetchall()
-            cursor.close()
-    finally:
-        if hasattr(conn, 'close'):
-            conn.close()
-
-    # Обрабатываем диагнозы
+    conn = sqlite3.connect('students.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
+    diagnoses = cursor.fetchall()
     all_diagnoses_from_db = []
-    for diag in diagnoses:
-        if isinstance(diag, dict):
-            diag_str = diag['diagnosis']
-        else:
-            diag_str = diag[0] if diag else ''
-
+    for diag_tuple in diagnoses:
+        diag_str = diag_tuple[0]
         if diag_str:
             diag_list = [d.strip() for d in diag_str.split(',')]
             all_diagnoses_from_db.extend(diag_list)
-
     all_diagnoses_from_db = list(set(all_diagnoses_from_db))
     all_diagnoses_from_db.sort()
+    conn.close()
 
     # Загружаем модель и скалер
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -109,10 +90,11 @@ def prepare_patient_features_for_prediction(student_data):
 def train_and_save_model():
     """
     Функция для обучения модели на основе данных из базы данных.
+    Теперь находит оптимальное количество кластеров и выводит информацию о них.
     """
     students = get_all_students()
-    if len(students) == 0:
-        print("Нет данных для обучения модели.")
+    if len(students) < 3: # KMeans требует минимум 2 точки, но для кластеризации лучше больше
+        print("Недостаточно данных для обучения модели (нужно минимум 3 ученика).")
         return
 
     data_list = []
@@ -136,13 +118,13 @@ def train_and_save_model():
         all_games = set()
         for games_list in data_processed['игры_список']:
             if isinstance(games_list, list):
-                all_games.update([str(game).strip() for game in games_list])
+                all_games.update([str(game).strip() for game in games_list if str(game).strip()])
 
         all_diagnoses = set()
         for diagnosis in data_processed['диагноз']:
             if pd.notna(diagnosis):
                 diagnoses = str(diagnosis).split(', ')
-                all_diagnoses.update([str(d).strip() for d in diagnoses])
+                all_diagnoses.update([str(d).strip() for d in diagnoses if str(d).strip()])
 
         features = []
         patient_ids = []
@@ -154,8 +136,9 @@ def train_and_save_model():
             for game in all_games:
                 feature_vector.append(1 if str(game) in current_games else 0)
 
-            current_diagnoses = str(row['диагноз']).split(', ') if pd.notna(row['диагноз']) else []
-            current_diagnoses = [str(d).strip() for d in current_diagnoses]
+            current_diagnoses = []
+            if pd.notna(row['диагноз']):
+                 current_diagnoses = [str(d).strip() for d in str(row['диагноз']).split(', ') if str(d).strip()]
             for diagnosis in all_diagnoses:
                 feature_vector.append(1 if str(diagnosis) in current_diagnoses else 0)
 
@@ -164,23 +147,193 @@ def train_and_save_model():
             patient_ids.append(str(row['ФИО']))
 
         feature_names = list(all_games) + list(all_diagnoses) + ['Возраст']
-        return np.array(features), feature_names, patient_ids, list(all_games), list(all_diagnoses), data_processed
+        return np.array(features), feature_names, patient_ids
 
-    X, _, _, all_games_from_func, all_diagnoses_from_func, _ = prepare_patient_features(data)
+    X, _, patient_ids = prepare_patient_features(data)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # --- НОВАЯ ЛОГИКА: Поиск оптимального k ---
+    def find_optimal_clusters_patients(X, max_k=10):
+        """
+        Находит оптимальное количество кластеров для пациентов
+        """
+        # Масштабируем данные для лучшей кластеризации
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    optimal_k = 3
+        # Убедимся, что max_k не превышает количество точек данных
+        max_k = min(max_k, len(X), len(X) - 1) # n_clusters должен быть < n_samples
+        if max_k < 2:
+             print("Недостаточно данных для кластеризации (max_k < 2).")
+             return pd.DataFrame(), StandardScaler() # Возвращаем пустой DF и пустой scaler
+
+        k_range = range(2, max_k + 1)
+        results = []
+
+        for k in k_range:
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(X_scaled)
+
+                # Вычисляем метрики
+                if len(set(labels)) > 1:  # Проверяем, что есть хотя бы 2 кластера
+                    silhouette = silhouette_score(X_scaled, labels)
+                    db_index = davies_bouldin_score(X_scaled, labels)
+                    ch_index = calinski_harabasz_score(X_scaled, labels)
+                    inertia = kmeans.inertia_
+
+                    # Вычисляем средний размер кластера
+                    cluster_sizes = np.bincount(labels)
+                    avg_cluster_size = np.mean(cluster_sizes)
+                    cluster_size_std = np.std(cluster_sizes)
+
+                else:
+                    silhouette = db_index = ch_index = inertia = avg_cluster_size = cluster_size_std = np.nan
+
+                results.append({
+                    'k': k,
+                    'silhouette': silhouette,
+                    'davies_bouldin': db_index,
+                    'calinski_harabasz': ch_index,
+                    'inertia': inertia,
+                    'avg_cluster_size': avg_cluster_size,
+                    'cluster_size_std': cluster_size_std
+                })
+            except Exception as e:
+                print(f"Ошибка при k={k}: {e}")
+                results.append({
+                    'k': k,
+                    'silhouette': np.nan,
+                    'davies_bouldin': np.nan,
+                    'calinski_harabasz': np.nan,
+                    'inertia': np.nan,
+                    'avg_cluster_size': np.nan,
+                    'cluster_size_std': np.nan
+                })
+
+        return pd.DataFrame(results), scaler
+
+    def select_optimal_k_patients(k_results, min_cluster_size=3):
+        """
+        Автоматический выбор оптимального k для пациентов с учетом размера кластеров
+        """
+        # Убираем строки с NaN значениями
+        df = k_results.dropna().copy()
+
+        if len(df) == 0:
+            print("Нет валидных результатов для выбора k, использую значение по умолчанию (3)")
+            return 3, df
+
+        # Нормализуем метрики
+        # Проверим, что у нас есть вариативность в данных перед нормализацией
+        if df['silhouette'].max() == df['silhouette'].min():
+            df['silhouette_norm'] = 0
+        else:
+            df['silhouette_norm'] = (df['silhouette'] - df['silhouette'].min()) / (df['silhouette'].max() - df['silhouette'].min())
+
+        if df['calinski_harabasz'].max() == df['calinski_harabasz'].min():
+            df['calinski_norm'] = 0
+        else:
+            df['calinski_norm'] = (df['calinski_harabasz'] - df['calinski_harabasz'].min()) / (df['calinski_harabasz'].max() - df['calinski_harabasz'].min())
+
+        if df['davies_bouldin'].max() == df['davies_bouldin'].min():
+            df['davies_norm'] = 1
+        else:
+            df['davies_norm'] = 1 - (df['davies_bouldin'] - df['davies_bouldin'].min()) / (df['davies_bouldin'].max() - df['davies_bouldin'].min())
+
+        if df['inertia'].max() == df['inertia'].min():
+            df['inertia_norm'] = 1
+        else:
+            df['inertia_norm'] = 1 - (df['inertia'] - df['inertia'].min()) / (df['inertia'].max() - df['inertia'].min())
+
+        # Штрафуем кластеры с малым средним размером
+        df['size_penalty'] = (df['avg_cluster_size'] - min_cluster_size) / (df['avg_cluster_size'].max() - min_cluster_size)
+        df['size_penalty'] = df['size_penalty'].clip(lower=0)  # Не штрафуем если размер больше минимального
+
+        # Композитная оценка с учетом размера кластеров
+        df['composite_score'] = (df['silhouette_norm'] + df['calinski_norm'] + df['davies_norm'] + df['inertia_norm'] + df['size_penalty']) / 5
+
+        optimal_k = df.loc[df['composite_score'].idxmax(), 'k']
+
+        return int(optimal_k), df
+
+    # Выполняем поиск
+    k_results, temp_scaler = find_optimal_clusters_patients(X)
+    if k_results.empty:
+         print("Невозможно определить оптимальное количество кластеров.")
+         return
+    print("Результаты поиска оптимального k для пациентов:")
+    print(k_results[['k', 'silhouette', 'davies_bouldin', 'calinski_harabasz', 'avg_cluster_size']].round(4))
+
+    optimal_k, k_scores = select_optimal_k_patients(k_results)
+    print(f"Оптимальное количество кластеров для пациентов: {optimal_k}")
+
+    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+    # Теперь обучаем финальную модель с найденным optimal_k
+    # Используем scaler, полученный из функции поиска оптимального k
+    X_scaled = temp_scaler.transform(X)
+
     kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
-    kmeans.fit(X_scaled)
+    final_labels = kmeans.fit_predict(X_scaled) # Получаем метки кластеров
 
+    # --- ВЫВОД ИНФОРМАЦИИ О КЛАСТЕРАХ ---
+    print("\n--- ИНФОРМАЦИЯ О КЛАСТЕРАХ ---")
+    for cluster_id in range(optimal_k):
+        cluster_mask = (final_labels == cluster_id)
+        cluster_students_info = data[cluster_mask] # Фильтруем DataFrame по метке кластера
+        cluster_students_count = len(cluster_students_info)
+
+        print(f"\nКЛАСТЕР {cluster_id}:")
+        print(f"  Количество детей: {cluster_students_count}")
+
+        if cluster_students_count > 0:
+            diagnoses_in_cluster = cluster_students_info['диагноз'].dropna().tolist()
+            ages_in_cluster = cluster_students_info['Возраст'].tolist()
+            games_played_in_cluster = cluster_students_info['игры'].dropna().tolist()
+
+            # Подсчет уникальных заболеваний
+            all_diagnoses = []
+            for diag_str in diagnoses_in_cluster:
+                if diag_str:
+                    all_diagnoses.extend([d.strip() for d in diag_str.split(',')])
+            unique_diagnoses = set(all_diagnoses)
+            print(f"  Уникальные диагнозы: {', '.join(sorted(unique_diagnoses)) if unique_diagnoses else 'N/A'}")
+
+            # Средний возраст
+            avg_age = sum(ages_in_cluster) / len(ages_in_cluster) if ages_in_cluster else 0
+            print(f"  Средний возраст: {avg_age:.2f}")
+
+            # Подсчет уникальных игр
+            all_games = []
+            for games_str in games_played_in_cluster:
+                if games_str:
+                    all_games.extend([g.strip() for g in games_str.split(',')])
+            unique_games = set(all_games)
+            print(f"  Уникальные игры: {', '.join(sorted(unique_games)) if unique_games else 'N/A'}")
+
+            # Вывод списка детей в кластере
+            print(f"  Дети в кластере:")
+            for _, row in cluster_students_info.iterrows():
+                print(f"    - {row['ФИО']}: {row['Возраст']} лет, диагноз: {row['диагноз'] or 'N/A'}, играл: {row['игры'] or 'N/A'}")
+
+        else:
+            print("  (пустой кластер)")
+
+    print("\n--- КОНЕЦ ИНФОРМАЦИИ О КЛАСТЕРАХ ---")
+    # --- КОНЕЦ ВЫВОДА ---
+
+    # Сохраняем модель и скалер
     with open(MODEL_PATH, 'wb') as f:
         pickle.dump(kmeans, f)
     with open(SCALER_PATH, 'wb') as f:
-        pickle.dump(scaler, f)
+        pickle.dump(temp_scaler, f) # Сохраняем scaler из поиска k
 
     print(f"Модель обучена и сохранена. K = {optimal_k}")
+    # Обновляем глобальные переменные модели после обучения
+    global kmeans_model, scaler
+    kmeans_model = kmeans
+    scaler = temp_scaler
+
 
 
 # --- Маршруты API ---
@@ -321,7 +474,7 @@ def index():
 @app.route('/add_student', methods=['GET', 'POST'])
 def add_student_page():
     """Страница для добавления нового ученика"""
-    conn = sqlite3.connect('students.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
     diagnoses = cursor.fetchall()
@@ -548,7 +701,7 @@ def add_assignment_page(student_id):
 
                     if primary_diagnosis:
                         print(f"  Используем диагноз '{primary_diagnosis}' для фильтрации рекомендаций.")
-                        conn = sqlite3.connect('students.db')
+                        conn = sqlite3.connect(DB_PATH)
                         cursor = conn.cursor()
                         cursor.execute("SELECT id FROM students WHERE diagnosis LIKE ?",
                                        ('%' + primary_diagnosis + '%',))
@@ -703,7 +856,7 @@ def edit_student_page(student_id):
     if not student:
         return "Ученик не найден", 404
 
-    conn = sqlite3.connect('students.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
     diagnoses = cursor.fetchall()
@@ -779,32 +932,7 @@ def edit_student_page(student_id):
                                   current_diagnoses=current_diagnoses)
 
 
-@app.route('/check_db')
-def check_db():
-    """Проверка подключения к базе данных"""
-    from database import get_connection, get_all_students, get_all_games
-
-    try:
-        conn = get_connection()
-        students_count = len(get_all_students())
-        games_count = len(get_all_games())
-
-        result = {
-            "database_url_exists": bool(os.environ.get('DATABASE_URL')),
-            "students_count": students_count,
-            "games_count": games_count,
-            "all_games": get_all_games()[:5]  # первые 5 игр
-        }
-
-        if hasattr(conn, 'close'):
-            conn.close()
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 if __name__ == '__main__':
     load_model_and_data()
-    # train_and_save_model()
+    train_and_save_model()
     app.run(debug=True)

@@ -299,7 +299,7 @@ def load_data_from_csv_to_db():
                         if game_id:
                             current_date = date.today().strftime('%Y-%m-%d')
                             cursor.execute(
-                                "INSERT INTO assignments (student_id, game_id, date) VALUES (%s, %s, %s)",
+                                "INSERT INTO assignments (student_id, game_id, date) VALUES (?, ?, ?)",
                                 (student_id, game_id, current_date)
                             )
 
