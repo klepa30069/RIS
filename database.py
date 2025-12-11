@@ -1,27 +1,56 @@
 # database_postgres.py
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sys
 import pandas as pd
 from datetime import date
 
-# Добавляем импорт sqlite3 для локальной разработки
-import sqlite3
+# Определяем, какой драйвер использовать
+USE_PSYCOPG3 = True
+
+if USE_PSYCOPG3:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        print("Используется psycopg3")
+    except ImportError:
+        print("psycopg3 не установлен, пробуем psycopg2")
+        USE_PSYCOPG3 = False
+
+if not USE_PSYCOPG3:
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        print("Используется psycopg2")
+    except ImportError:
+        print("psycopg2 не установлен, используем SQLite")
+        import sqlite3
 
 # Получаем URL базы данных из переменных окружения Railway
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 
 def get_connection():
-    """Получить соединение с PostgreSQL"""
+    """Получить соединение с базой данных"""
     if not DATABASE_URL:
-        # Для локальной разработки можно использовать SQLite
+        # Для локальной разработки используем SQLite
         import sqlite3
         return sqlite3.connect('students.db')
 
-    # Railway предоставляет DATABASE_URL в формате postgresql://...
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    try:
+        if USE_PSYCOPG3:
+            # Используем psycopg3
+            conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        else:
+            # Используем psycopg2
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        return conn
+    except Exception as e:
+        print(f"Ошибка подключения к PostgreSQL: {e}")
+        # Fallback на SQLite
+        import sqlite3
+        return sqlite3.connect('students.db')
 
 
 def init_db():
@@ -88,6 +117,75 @@ def init_db():
     conn.close()
 
 
+# Остальные функции остаются такими же, как в предыдущей версии
+# но с поддержкой psycopg3
+
+def execute_query(query, params=None, fetch=False):
+    """Универсальная функция выполнения запроса"""
+    conn = get_connection()
+
+    if isinstance(conn, sqlite3.Connection):
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+
+        if fetch:
+            result = cursor.fetchall()
+        else:
+            result = cursor.lastrowid if query.strip().upper().startswith('INSERT') else None
+
+        if not fetch and query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
+            conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        if fetch:
+            # Преобразуем строки SQLite в словари для совместимости
+            if cursor.description:
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in result]
+            return result
+        return result
+    else:
+        # PostgreSQL
+        cursor = conn.cursor()
+
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+
+            if fetch:
+                result = cursor.fetchall()
+                # psycopg3 возвращает список словарей напрямую
+                # psycopg2 через RealDictCursor тоже
+                return result
+            else:
+                # Для INSERT с RETURNING
+                if query.strip().upper().startswith('INSERT') and 'RETURNING' in query.upper():
+                    result = cursor.fetchone()
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    return result['id'] if result else None
+
+                conn.commit()
+                cursor.close()
+                conn.close()
+                return cursor.rowcount
+
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+
+
+# Упрощенные версии функций
 def load_data_from_csv_to_db():
     """Загружает данные из CSV в базу данных, если таблица students пуста."""
     conn = get_connection()
@@ -110,20 +208,26 @@ def load_data_from_csv_to_db():
     print("Загружаю данные из CSV в базу данных...")
 
     try:
-        # Загружаем CSV из локального файла
         csv_path = 'Data.csv'
+        if not os.path.exists(csv_path):
+            print(f"Файл {csv_path} не найден. Ищем в других местах...")
+            # Пробуем найти файл
+            for file in os.listdir('.'):
+                if file.lower().endswith('.csv'):
+                    csv_path = file
+                    print(f"Найден CSV файл: {csv_path}")
+                    break
+
         df = pd.read_csv(csv_path, sep=';', encoding='cp1251')
         print(f"CSV файл успешно загружен. Количество строк: {len(df)}")
 
-        # Загружаем учеников
         for index, row in df.iterrows():
             name = row['ФИО']
             age_str = str(row['Возраст']).replace(',', '.')
             try:
                 age = float(age_str)
             except ValueError:
-                print(
-                    f"Предупреждение (строка {index + 1}): Невозможно преобразовать возраст '{row['Возраст']}' для {name} в float. Пропускаю.")
+                print(f"Предупреждение (строка {index + 1}): Невозможно преобразовать возраст для {name}. Пропускаю.")
                 continue
             diagnosis = row['диагноз']
 
@@ -155,37 +259,29 @@ def load_data_from_csv_to_db():
                             if game_result:
                                 game_id = game_result[0]
                         else:
+                            # Для PostgreSQL
                             cursor.execute(
-                                "INSERT INTO games (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
+                                "INSERT INTO games (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
                                 (game_name,)
                             )
+                            cursor.execute("SELECT id FROM games WHERE name = %s", (game_name,))
                             game_result = cursor.fetchone()
-                            if game_result:
-                                game_id = game_result['id']
-                            else:
-                                cursor.execute("SELECT id FROM games WHERE name = %s", (game_name,))
-                                game_result = cursor.fetchone()
-                                game_id = game_result['id'] if game_result else None
+                            game_id = game_result['id'] if game_result else None
 
                         if game_id:
-                            # Вставляем назначение
                             current_date = date.today().strftime('%Y-%m-%d')
-                            if isinstance(conn, sqlite3.Connection):
-                                cursor.execute(
-                                    "INSERT INTO assignments (student_id, game_id, date) VALUES (?, ?, ?)",
-                                    (student_id, game_id, current_date)
-                                )
-                            else:
-                                cursor.execute(
-                                    "INSERT INTO assignments (student_id, game_id, date) VALUES (%s, %s, %s)",
-                                    (student_id, game_id, current_date)
-                                )
+                            cursor.execute(
+                                "INSERT INTO assignments (student_id, game_id, date) VALUES (%s, %s, %s)",
+                                (student_id, game_id, current_date)
+                            )
 
         conn.commit()
         print("Данные успешно загружены из CSV в базу данных.")
 
     except Exception as e:
         print(f"Ошибка при загрузке данных из CSV: {e}")
+        import traceback
+        traceback.print_exc()
         conn.rollback()
     finally:
         cursor.close()
@@ -194,24 +290,36 @@ def load_data_from_csv_to_db():
 
 def get_all_students():
     """Получить всех учеников"""
-    conn = get_connection()
+    query = "SELECT id, name, age, diagnosis FROM students ORDER BY name"
+    results = execute_query(query, fetch=True)
 
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, age, diagnosis FROM students ORDER BY name")
-        students = cursor.fetchall()
-        # SQLite возвращает кортежи
-        result = students
-    else:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, age, diagnosis FROM students ORDER BY name")
-        students = cursor.fetchall()
-        # Преобразуем RealDictRow в кортеж для совместимости
-        result = [(s['id'], s['name'], s['age'], s['diagnosis']) for s in students]
+    # Преобразуем в формат кортежей для совместимости
+    students = []
+    for row in results:
+        if isinstance(row, dict):
+            students.append((row['id'], row['name'], row['age'], row['diagnosis']))
+        else:
+            # Уже кортеж от SQLite
+            students.append(row)
 
-    cursor.close()
-    conn.close()
-    return result
+    return students
+
+
+def get_all_games():
+    """Получить все уникальные игры из базы данных"""
+    query = "SELECT name FROM games ORDER BY name"
+    results = execute_query(query, fetch=True)
+
+    games = []
+    for row in results:
+        if isinstance(row, dict):
+            games.append(row['name'])
+        elif isinstance(row, tuple):
+            games.append(row[0])
+        else:
+            games.append(row)
+
+    return games
 
 
 def add_student(name, age, diagnosis):
@@ -220,8 +328,15 @@ def add_student(name, age, diagnosis):
 
     if isinstance(conn, sqlite3.Connection):
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO students (name, age, diagnosis) VALUES (?, ?, ?)", (name, age, diagnosis))
+        cursor.execute(
+            "INSERT INTO students (name, age, diagnosis) VALUES (?, ?, ?)",
+            (name, age, diagnosis)
+        )
         student_id = cursor.lastrowid
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return student_id
     else:
         cursor = conn.cursor()
         cursor.execute(
@@ -229,11 +344,10 @@ def add_student(name, age, diagnosis):
             (name, age, diagnosis)
         )
         student_id = cursor.fetchone()['id']
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return student_id
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return student_id
 
 
 def get_student(student_id):
@@ -244,15 +358,18 @@ def get_student(student_id):
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, age, diagnosis FROM students WHERE id = ?", (student_id,))
         student = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return student
     else:
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, age, diagnosis FROM students WHERE id = %s", (student_id,))
         result = cursor.fetchone()
-        student = (result['id'], result['name'], result['age'], result['diagnosis']) if result else None
-
-    cursor.close()
-    conn.close()
-    return student
+        cursor.close()
+        conn.close()
+        if result:
+            return (result['id'], result['name'], result['age'], result['diagnosis'])
+        return None
 
 
 def get_student_games(student_id):
@@ -269,6 +386,9 @@ def get_student_games(student_id):
             ORDER BY a.date DESC
         """, (student_id,))
         games = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return games
     else:
         cursor = conn.cursor()
         cursor.execute("""
@@ -279,12 +399,10 @@ def get_student_games(student_id):
             ORDER BY a.date DESC
         """, (student_id,))
         games = cursor.fetchall()
+        cursor.close()
+        conn.close()
         # Преобразуем в список кортежей
-        games = [(g['name'], g['date']) for g in games]
-
-    cursor.close()
-    conn.close()
-    return games
+        return [(g['name'], g['date']) for g in games]
 
 
 def add_game(game_name):
@@ -303,7 +421,7 @@ def add_game(game_name):
                 raise Exception(f"Не удалось получить ID для игры {game_name}")
         else:
             cursor = conn.cursor()
-            # Пытаемся вставить игру
+            # Для PostgreSQL
             cursor.execute(
                 "INSERT INTO games (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
                 (game_name,)
@@ -313,7 +431,7 @@ def add_game(game_name):
             if game_result:
                 game_id = game_result['id']
             else:
-                # Игра уже существует, получаем ее ID
+                # Игра уже существует
                 cursor.execute("SELECT id FROM games WHERE name = %s", (game_name,))
                 game_result = cursor.fetchone()
                 if game_result:
@@ -325,144 +443,70 @@ def add_game(game_name):
         return game_id
 
     except Exception as e:
-        conn.rollback()
+        if 'conn' in locals():
+            conn.rollback()
         raise e
     finally:
-        cursor.close()
-        conn.close()
-
-
-def get_all_games():
-    """Получить все уникальные игры из базы данных"""
-    conn = get_connection()
-
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM games ORDER BY name")
-        games = [row[0] for row in cursor.fetchall()]
-    else:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM games ORDER BY name")
-        games = [row['name'] for row in cursor.fetchall()]
-
-    cursor.close()
-    conn.close()
-    return games
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
 
 def add_assignment(student_id, game_id, date_str):
     """Назначить задание ученику"""
-    conn = get_connection()
-
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO assignments (student_id, game_id, date) VALUES (?, ?, ?)",
-            (student_id, game_id, date_str)
-        )
-    else:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO assignments (student_id, game_id, date) VALUES (%s, %s, %s)",
-            (student_id, game_id, date_str)
-        )
-
-    conn.commit()
-    cursor.close()
-    conn.close()
+    query = "INSERT INTO assignments (student_id, game_id, date) VALUES (%s, %s, %s)"
+    execute_query(query, (student_id, game_id, date_str))
 
 
 def get_student_data_for_model(student_id):
     """Получить данные ученика для использования в модели кластеризации"""
-    conn = get_connection()
+    # Получаем данные ученика
+    student_query = "SELECT name, age, diagnosis FROM students WHERE id = %s"
+    student_result = execute_query(student_query, (student_id,), fetch=True)
 
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, age, diagnosis FROM students WHERE id = ?", (student_id,))
-        student = cursor.fetchone()
-        if not student:
-            cursor.close()
-            conn.close()
-            return None
+    if not student_result:
+        return None
 
-        name, age, diagnosis = student
+    student_data = student_result[0]
 
-        cursor.execute("""
-            SELECT g.name
-            FROM assignments a
-            JOIN games g ON a.game_id = g.id
-            WHERE a.student_id = ?
-        """, (student_id,))
-        played_games = [row[0] for row in cursor.fetchall()]
-    else:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, age, diagnosis FROM students WHERE id = %s", (student_id,))
-        result = cursor.fetchone()
-        if not result:
-            cursor.close()
-            conn.close()
-            return None
+    # Получаем игры ученика
+    games_query = """
+        SELECT g.name
+        FROM assignments a
+        JOIN games g ON a.game_id = g.id
+        WHERE a.student_id = %s
+    """
+    games_result = execute_query(games_query, (student_id,), fetch=True)
 
-        name = result['name']
-        age = result['age']
-        diagnosis = result['diagnosis']
-
-        cursor.execute("""
-            SELECT g.name
-            FROM assignments a
-            JOIN games g ON a.game_id = g.id
-            WHERE a.student_id = %s
-        """, (student_id,))
-        played_games = [row['name'] for row in cursor.fetchall()]
-
-    cursor.close()
-    conn.close()
+    played_games = []
+    for game in games_result:
+        if isinstance(game, dict):
+            played_games.append(game['name'])
+        elif isinstance(game, tuple):
+            played_games.append(game[0])
+        else:
+            played_games.append(game)
 
     return {
-        'name': name,
-        'age': age,
-        'diagnosis': diagnosis,
+        'name': student_data['name'] if isinstance(student_data, dict) else student_data[0],
+        'age': student_data['age'] if isinstance(student_data, dict) else student_data[1],
+        'diagnosis': student_data['diagnosis'] if isinstance(student_data, dict) else student_data[2],
         'played_games': played_games
     }
 
 
 def update_student(student_id, name, age, diagnosis):
     """Обновить данные ученика"""
-    conn = get_connection()
-
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE students SET name = ?, age = ?, diagnosis = ? WHERE id = ?",
-            (name, age, diagnosis, student_id)
-        )
-    else:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE students SET name = %s, age = %s, diagnosis = %s WHERE id = %s",
-            (name, age, diagnosis, student_id)
-        )
-
-    conn.commit()
-    cursor.close()
-    conn.close()
+    query = "UPDATE students SET name = %s, age = %s, diagnosis = %s WHERE id = %s"
+    execute_query(query, (name, age, diagnosis, student_id))
 
 
 def delete_student(student_id):
     """Удалить ученика и все его назначения"""
-    conn = get_connection()
+    query = "DELETE FROM students WHERE id = %s"
+    execute_query(query, (student_id,))
 
-    if isinstance(conn, sqlite3.Connection):
-        cursor = conn.cursor()
-        # В SQLite каскадное удаление должно быть настроено через внешние ключи
-        cursor.execute("DELETE FROM assignments WHERE student_id = ?", (student_id,))
-        cursor.execute("DELETE FROM students WHERE id = ?", (student_id,))
-    else:
-        cursor = conn.cursor()
-        # В PostgreSQL ON DELETE CASCADE автоматически удаляет связанные записи
-        cursor.execute("DELETE FROM students WHERE id = %s", (student_id,))
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
+# Импортируем sqlite3 для локальной разработки
+import sqlite3
