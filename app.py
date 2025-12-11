@@ -170,8 +170,12 @@ def train_and_save_model():
 def index():
     """Главная страница со списком учеников"""
     students = get_all_students()
+
     global all_diagnoses_from_db
     all_diagnoses = all_diagnoses_from_db
+    # --- ПЕРЕДАЕМ КОЛИЧЕСТВО ДИАГНОЗОВ ---
+    num_diagnoses = len(all_diagnoses)
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     html_template = '''
 <!DOCTYPE html>
@@ -283,11 +287,16 @@ def index():
         });
 
         updateCardVisibility();
+
+        // --- ВЫВОД КОЛИЧЕСТВА ТЕГОВ В КОНСОЛЬ ---
+        console.log("Количество найденных тегов (диагнозов): {{ num_diagnoses }}");
+        // --- КОНЕЦ ВЫВОДА ---
     </script>
 </body>
 </html>
     '''
-    return render_template_string(html_template, students=students, all_diagnoses=all_diagnoses)
+    return render_template_string(html_template, students=students, all_diagnoses=all_diagnoses,
+                                  num_diagnoses=num_diagnoses)
 
 
 @app.route('/add_student', methods=['GET', 'POST'])
@@ -485,6 +494,8 @@ def add_assignment_page(student_id):
 
         return redirect(url_for('student_page', student_id=student_id))
 
+    # ... (остальной код функции add_assignment_page без изменений) ...
+    # (включая логику рекомендаций и вывод HTML) ...
     recommended_games = []
     cluster_label = None  # Переменная для хранения метки кластера
     if kmeans_model and scaler:
@@ -579,6 +590,10 @@ def add_assignment_page(student_id):
     if not kmeans_model or not scaler:
         recommended_games = all_games_from_db
 
+    # --- ПЕРЕДАЕМ КОЛИЧЕСТВО ВСЕХ ИГР ---
+    num_all_games = len(all_games_from_db)
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     html_template = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -595,13 +610,19 @@ def add_assignment_page(student_id):
         button:hover { background-color: #45a049; }
         .recommended-games { margin-top: 20px; }
         /* Исправление выравнивания и расположения */
-        LABEL.game-label-checkbox
-        {
-          margin-left: 2em;
-          display: block;
-          position: relative;
-          margin-top: -1.4em;  /* make this margin match whatever your line-height is */
-          line-height: 1.4em;  /* can be set here, or elsewehere */
+        .game-checkbox {
+            margin: 5px 0;
+            display: block; /* Делаем элемент блочным */
+            line-height: 1.5; /* Устанавливаем высоту строки */
+        }
+        .game-checkbox input {
+            margin-right: 8px; /* Отступ между чекбоксом и лейблом */
+            vertical-align: middle; /* Выравниваем чекбокс по центру */
+        }
+        .game-checkbox label {
+            vertical-align: middle; /* Выравниваем лейбл по центру */
+            margin: 0; /* Убираем стандартные отступы */
+            padding: 0;
         }
         .back-link { display: inline-block; margin-top: 20px; text-decoration: none; color: #0066cc; }
     </style>
@@ -622,7 +643,7 @@ def add_assignment_page(student_id):
                     {% for game in recommended_games %}
                         <div class="game-checkbox">
                             <input type="checkbox" id="game_{{ loop.index }}" name="selected_games" value="{{ game }}">
-                            <label for="game_{{ loop.index }}" class="game-label-checkbox">{{ game }}</label>
+                            <label for="game_{{ loop.index }}">{{ game }}</label>
                         </div>
                     {% endfor %}
                 {% else %}
@@ -649,13 +670,17 @@ def add_assignment_page(student_id):
     <script>
         // Выводим информацию о кластере в консоль браузера
         console.log("Ученик принадлежит кластеру: {{ cluster_label }}");
+        // --- ВЫВОД КОЛИЧЕСТВА ИГР В КОНСОЛЬ ---
+        console.log("Количество найденных игр: {{ num_all_games }}");
+        // --- КОНЕЦ ВЫВОДА ---
     </script>
 </body>
 </html>
     '''
     from datetime import date
     return render_template_string(html_template, student=student, recommended_games=recommended_games,
-                                  all_games=all_games_from_db, date=date, cluster_label=cluster_label)
+                                  all_games=all_games_from_db, date=date, cluster_label=cluster_label,
+                                  num_all_games=num_all_games)
 
 
 @app.route('/edit_student/<int:student_id>', methods=['GET', 'POST'])
