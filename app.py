@@ -1,27 +1,23 @@
 # app.py
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 import sqlite3
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
-from sklearn.decomposition import PCA
 import pickle
 import os
-from datetime import date  # Импортируем date для форматирования
+from datetime import date
 
 app = Flask(__name__)
 
 # --- Импортируем функции работы с базой данных ---
 from database import init_db, load_data_from_csv_to_db, get_all_students, add_student, get_student, get_student_games, \
-    add_game, get_all_games, add_assignment, get_student_data_for_model, update_student, \
-    delete_student  # Импортируем новую функцию
+    add_game, get_all_games, add_assignment, get_student_data_for_model, update_student, delete_student
 
 # Путь к модели и скалеру
 MODEL_PATH = 'model.pkl'
 SCALER_PATH = 'scaler.pkl'
-DB_PATH = 'students.db'
 
 # Глобальные переменные для модели
 kmeans_model = None
@@ -41,19 +37,42 @@ def load_model_and_data():
 
     # Загружаем все игры и диагнозы из базы данных
     all_games_from_db = get_all_games()
-    conn = sqlite3.connect('students.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
-    diagnoses = cursor.fetchall()
+
+    # Получаем диагнозы через функцию базы данных
+    from database import get_connection
+    conn = get_connection()
+
+    try:
+        if hasattr(conn, 'cursor'):
+            # PostgreSQL через psycopg
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
+            diagnoses = cursor.fetchall()
+            cursor.close()
+        else:
+            # SQLite
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
+            diagnoses = cursor.fetchall()
+            cursor.close()
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
+
+    # Обрабатываем диагнозы
     all_diagnoses_from_db = []
-    for diag_tuple in diagnoses:
-        diag_str = diag_tuple[0]
+    for diag in diagnoses:
+        if isinstance(diag, dict):
+            diag_str = diag['diagnosis']
+        else:
+            diag_str = diag[0] if diag else ''
+
         if diag_str:
             diag_list = [d.strip() for d in diag_str.split(',')]
             all_diagnoses_from_db.extend(diag_list)
+
     all_diagnoses_from_db = list(set(all_diagnoses_from_db))
     all_diagnoses_from_db.sort()
-    conn.close()
 
     # Загружаем модель и скалер
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -302,7 +321,7 @@ def index():
 @app.route('/add_student', methods=['GET', 'POST'])
 def add_student_page():
     """Страница для добавления нового ученика"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect('students.db')
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
     diagnoses = cursor.fetchall()
@@ -529,7 +548,7 @@ def add_assignment_page(student_id):
 
                     if primary_diagnosis:
                         print(f"  Используем диагноз '{primary_diagnosis}' для фильтрации рекомендаций.")
-                        conn = sqlite3.connect(DB_PATH)
+                        conn = sqlite3.connect('students.db')
                         cursor = conn.cursor()
                         cursor.execute("SELECT id FROM students WHERE diagnosis LIKE ?",
                                        ('%' + primary_diagnosis + '%',))
@@ -610,19 +629,13 @@ def add_assignment_page(student_id):
         button:hover { background-color: #45a049; }
         .recommended-games { margin-top: 20px; }
         /* Исправление выравнивания и расположения */
-        .game-checkbox {
-            margin: 5px 0;
-            display: block; /* Делаем элемент блочным */
-            line-height: 1.5; /* Устанавливаем высоту строки */
-        }
-        .game-checkbox input {
-            margin-right: 8px; /* Отступ между чекбоксом и лейблом */
-            vertical-align: middle; /* Выравниваем чекбокс по центру */
-        }
-        .game-checkbox label {
-            vertical-align: middle; /* Выравниваем лейбл по центру */
-            margin: 0; /* Убираем стандартные отступы */
-            padding: 0;
+        LABEL.game-label-checkbox
+        {
+          margin-left: 2em;
+          display: block;
+          position: relative;
+          margin-top: -1.4em;  /* make this margin match whatever your line-height is */
+          line-height: 1.4em;  /* can be set here, or elsewehere */
         }
         .back-link { display: inline-block; margin-top: 20px; text-decoration: none; color: #0066cc; }
     </style>
@@ -643,7 +656,7 @@ def add_assignment_page(student_id):
                     {% for game in recommended_games %}
                         <div class="game-checkbox">
                             <input type="checkbox" id="game_{{ loop.index }}" name="selected_games" value="{{ game }}">
-                            <label for="game_{{ loop.index }}">{{ game }}</label>
+                            <label for="game_{{ loop.index }}" class="game-label-checkbox">{{ game }}</label>
                         </div>
                     {% endfor %}
                 {% else %}
@@ -690,7 +703,7 @@ def edit_student_page(student_id):
     if not student:
         return "Ученик не найден", 404
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect('students.db')
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT diagnosis FROM students WHERE diagnosis IS NOT NULL AND diagnosis != ''")
     diagnoses = cursor.fetchall()
@@ -764,6 +777,31 @@ def edit_student_page(student_id):
     '''
     return render_template_string(html_template, student=student, all_diagnoses=all_diagnoses,
                                   current_diagnoses=current_diagnoses)
+
+
+@app.route('/check_db')
+def check_db():
+    """Проверка подключения к базе данных"""
+    from database import get_connection, get_all_students, get_all_games
+
+    try:
+        conn = get_connection()
+        students_count = len(get_all_students())
+        games_count = len(get_all_games())
+
+        result = {
+            "database_url_exists": bool(os.environ.get('DATABASE_URL')),
+            "students_count": students_count,
+            "games_count": games_count,
+            "all_games": get_all_games()[:5]  # первые 5 игр
+        }
+
+        if hasattr(conn, 'close'):
+            conn.close()
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':

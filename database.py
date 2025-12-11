@@ -1,54 +1,42 @@
-# database_postgres.py
+# database.py (переименуйте database_postgres.py в database.py)
 import os
-import sys
 import pandas as pd
 from datetime import date
-
-# Определяем, какой драйвер использовать
-USE_PSYCOPG3 = True
-
-if USE_PSYCOPG3:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-
-        print("Используется psycopg3")
-    except ImportError:
-        print("psycopg3 не установлен, пробуем psycopg2")
-        USE_PSYCOPG3 = False
-
-if not USE_PSYCOPG3:
-    try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-
-        print("Используется psycopg2")
-    except ImportError:
-        print("psycopg2 не установлен, используем SQLite")
-        import sqlite3
 
 # Получаем URL базы данных из переменных окружения Railway
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+if DATABASE_URL:
+    # Если есть DATABASE_URL, используем PostgreSQL
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        print("Используется PostgreSQL с psycopg3")
+        USE_POSTGRES = True
+    except ImportError:
+        print("psycopg3 не установлен, проверьте requirements.txt")
+        USE_POSTGRES = False
+else:
+    # Для локальной разработки используем SQLite
+    print("DATABASE_URL не найден, используем SQLite для локальной разработки")
+    USE_POSTGRES = False
+    import sqlite3
+
 
 def get_connection():
     """Получить соединение с базой данных"""
-    if not DATABASE_URL:
-        # Для локальной разработки используем SQLite
+    if not USE_POSTGRES:
         import sqlite3
         return sqlite3.connect('students.db')
 
     try:
-        if USE_PSYCOPG3:
-            # Используем psycopg3
-            conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        else:
-            # Используем psycopg2
-            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        # Используем psycopg3 для PostgreSQL
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
         return conn
     except Exception as e:
         print(f"Ошибка подключения к PostgreSQL: {e}")
-        # Fallback на SQLite
+        # Fallback на SQLite для совместимости
         import sqlite3
         return sqlite3.connect('students.db')
 
@@ -57,8 +45,8 @@ def init_db():
     """Инициализация базы данных и создание таблиц"""
     conn = get_connection()
 
-    if isinstance(conn, sqlite3.Connection):
-        # Код для SQLite (локальная разработка)
+    if not USE_POSTGRES:
+        # SQLite
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS students (
@@ -85,7 +73,7 @@ def init_db():
             )
         ''')
     else:
-        # Код для PostgreSQL (продакшн)
+        # PostgreSQL
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS students (
@@ -115,10 +103,49 @@ def init_db():
     conn.commit()
     cursor.close()
     conn.close()
+    print("База данных инициализирована")
 
 
-# Остальные функции остаются такими же, как в предыдущей версии
-# но с поддержкой psycopg3
+# ... остальные функции остаются аналогичными, но с проверкой USE_POSTGRES ...
+
+def get_all_students():
+    """Получить всех учеников"""
+    conn = get_connection()
+
+    if not USE_POSTGRES:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, age, diagnosis FROM students ORDER BY name")
+        students = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return students
+    else:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, age, diagnosis FROM students ORDER BY name")
+        students = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        # Преобразуем словари в кортежи для совместимости
+        return [(s['id'], s['name'], s['age'], s['diagnosis']) for s in students]
+
+
+def get_all_games():
+    """Получить все уникальные игры из базы данных"""
+    conn = get_connection()
+
+    if not USE_POSTGRES:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM games ORDER BY name")
+        games = [row[0] for row in cursor.fetchall()]
+    else:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM games ORDER BY name")
+        games = [row['name'] for row in cursor.fetchall()]
+
+    cursor.close()
+    conn.close()
+    return games
+
 
 def execute_query(query, params=None, fetch=False):
     """Универсальная функция выполнения запроса"""
@@ -127,6 +154,7 @@ def execute_query(query, params=None, fetch=False):
     if isinstance(conn, sqlite3.Connection):
         cursor = conn.cursor()
         if params:
+            query = query.replace('%s', '?')
             cursor.execute(query, params)
         else:
             cursor.execute(query)
@@ -286,40 +314,6 @@ def load_data_from_csv_to_db():
     finally:
         cursor.close()
         conn.close()
-
-
-def get_all_students():
-    """Получить всех учеников"""
-    query = "SELECT id, name, age, diagnosis FROM students ORDER BY name"
-    results = execute_query(query, fetch=True)
-
-    # Преобразуем в формат кортежей для совместимости
-    students = []
-    for row in results:
-        if isinstance(row, dict):
-            students.append((row['id'], row['name'], row['age'], row['diagnosis']))
-        else:
-            # Уже кортеж от SQLite
-            students.append(row)
-
-    return students
-
-
-def get_all_games():
-    """Получить все уникальные игры из базы данных"""
-    query = "SELECT name FROM games ORDER BY name"
-    results = execute_query(query, fetch=True)
-
-    games = []
-    for row in results:
-        if isinstance(row, dict):
-            games.append(row['name'])
-        elif isinstance(row, tuple):
-            games.append(row[0])
-        else:
-            games.append(row)
-
-    return games
 
 
 def add_student(name, age, diagnosis):
